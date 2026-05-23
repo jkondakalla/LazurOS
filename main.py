@@ -27,7 +27,7 @@ SHELL_URL            = os.getenv("SHELL_URL", "http://localhost:3000")
 COMPUTE_BASE_URL = f"http://{COMPUTE_NODE_IP}:{COMPUTE_API_PORT}"
 CONNECT_TIMEOUT  = 1.0
 
-app = FastAPI(title="LazurOS", version="0.1.0")
+app = FastAPI(title="LazurOS", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +39,6 @@ app.add_middleware(
 
 
 def _port_open(ip: str, port: int, timeout: float = CONNECT_TIMEOUT) -> bool:
-    """Quick TCP probe — returns True if the port accepts connections."""
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -48,36 +47,84 @@ def _port_open(ip: str, port: int, timeout: float = CONNECT_TIMEOUT) -> bool:
 
 
 async def _wake_and_wait() -> bool:
-    """Send WoL packet, then poll until compute API port is open or timeout."""
-    log.info("Compute node is asleep — sending Wake-on-LAN to %s", COMPUTE_NODE_MAC)
+    log.info("Compute node asleep — sending WoL to %s", COMPUTE_NODE_MAC)
     send_magic_packet(COMPUTE_NODE_MAC)
-
     deadline = time.monotonic() + WAKE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT):
             log.info("Compute node is up.")
             return True
         await asyncio.sleep(1)
-
     log.error("Compute node did not respond within %ds.", WAKE_TIMEOUT_SECONDS)
     return False
 
 
 async def _ensure_compute_online() -> bool:
-    """Fast path if awake, wake path if not."""
     if _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT):
         return True
     return await _wake_and_wait()
 
 
+# ── Public endpoints (no auth required) ──────────────────────────────────────
+
 @app.get("/health")
 async def health():
     alive = _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT)
-    return {"lazuros": "ok", "compute_node": "up" if alive else "sleeping"}
+    return {
+        "lazuros": "ok",
+        "compute_node": "up" if alive else "sleeping",
+        "compute_online": alive,          # widget uses this field
+        "compute_ip": COMPUTE_NODE_IP,
+        "compute_port": COMPUTE_API_PORT,
+    }
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+# ── Authenticated management endpoints ───────────────────────────────────────
+
+@app.post("/wake")
+async def wake(_user: CurrentUser):
+    """Send a WoL packet to the compute node. Responds immediately; node may take up to WAKE_TIMEOUT_SECONDS to come up."""
+    if _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT):
+        return {"waking": False, "message": "Compute node is already online"}
+    asyncio.create_task(_wake_and_wait())
+    return {"waking": True, "message": f"WoL packet sent to {COMPUTE_NODE_MAC}"}
+
+
+@app.get("/models")
+async def models(_user: CurrentUser):
+    """List available Ollama models. Returns sleeping=True and empty list if node is down."""
+    if not _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT):
+        return {"sleeping": True, "models": []}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{COMPUTE_BASE_URL}/api/tags")
+            data = r.json()
+            return {"sleeping": False, "models": data.get("models", [])}
+    except Exception as e:
+        log.error("Failed to fetch models: %s", e)
+        return {"sleeping": False, "models": [], "error": str(e)}
+
+
+@app.get("/ps")
+async def ps(_user: CurrentUser):
+    """Show currently running (loaded into VRAM) Ollama models."""
+    if not _port_open(COMPUTE_NODE_IP, COMPUTE_API_PORT):
+        return {"sleeping": True, "models": []}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{COMPUTE_BASE_URL}/api/ps")
+            data = r.json()
+            return {"sleeping": False, "models": data.get("models", [])}
+    except Exception as e:
+        log.error("Failed to fetch ps: %s", e)
+        return {"sleeping": False, "models": [], "error": str(e)}
+
+
+# ── Authenticated proxy (catch-all — forwards to Ollama) ─────────────────────
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy(request: Request, path: str, _user: CurrentUser):
+    """Proxy all /api/* requests to Ollama on the compute node. Wakes node if sleeping."""
     if not await _ensure_compute_online():
         return Response(
             content='{"error": "Compute node did not wake in time"}',
@@ -85,18 +132,15 @@ async def proxy(request: Request, path: str, _user: CurrentUser):
             media_type="application/json",
         )
 
-    target_url = f"{COMPUTE_BASE_URL}/{path}"
+    target_url = f"{COMPUTE_BASE_URL}/api/{path}"
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
 
     headers = dict(request.headers)
-    # Strip hop-by-hop headers that must not be forwarded
-    for h in ("host", "content-length", "transfer-encoding", "connection"):
+    for h in ("host", "content-length", "transfer-encoding", "connection", "cookie", "authorization"):
         headers.pop(h, None)
 
     body = await request.body()
-
-    # Detect streaming intent: OpenAI clients set stream=true in JSON body
     wants_stream = b'"stream":true' in body or b'"stream": true' in body
 
     async with httpx.AsyncClient(timeout=None) as client:
