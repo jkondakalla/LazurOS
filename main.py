@@ -7,23 +7,35 @@ import time
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from wakeonlan import send_magic_packet
+
+from auth import CurrentUser
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lazuros")
 
-COMPUTE_NODE_IP = os.getenv("COMPUTE_NODE_IP", "192.168.1.100")
-COMPUTE_NODE_MAC = os.getenv("COMPUTE_NODE_MAC", "AA:BB:CC:DD:EE:FF")
-COMPUTE_API_PORT = int(os.getenv("COMPUTE_API_PORT", "11434"))
+COMPUTE_NODE_IP      = os.getenv("COMPUTE_NODE_IP", "192.168.1.100")
+COMPUTE_NODE_MAC     = os.getenv("COMPUTE_NODE_MAC", "AA:BB:CC:DD:EE:FF")
+COMPUTE_API_PORT     = int(os.getenv("COMPUTE_API_PORT", "11434"))
 WAKE_TIMEOUT_SECONDS = int(os.getenv("WAKE_TIMEOUT_SECONDS", "45"))
+SHELL_URL            = os.getenv("SHELL_URL", "http://localhost:3000")
 
 COMPUTE_BASE_URL = f"http://{COMPUTE_NODE_IP}:{COMPUTE_API_PORT}"
-CONNECT_TIMEOUT = 1.0  # seconds for health probe
+CONNECT_TIMEOUT  = 1.0
 
 app = FastAPI(title="LazurOS", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[SHELL_URL],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 
 def _port_open(ip: str, port: int, timeout: float = CONNECT_TIMEOUT) -> bool:
@@ -65,7 +77,7 @@ async def health():
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy(request: Request, path: str):
+async def proxy(request: Request, path: str, _user: CurrentUser):
     if not await _ensure_compute_online():
         return Response(
             content='{"error": "Compute node did not wake in time"}',
