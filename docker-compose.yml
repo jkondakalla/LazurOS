@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  lazuros:
+    build: .
+    container_name: lazuros
+    restart: unless-stopped
+    # network_mode: host lets the container send raw broadcast WoL packets
+    # on the LAN without extra routing config. Required for WoL to work.
+    network_mode: host
+    env_file:
+      - .env
+    # If you prefer bridge networking, remove network_mode above and
+    # uncomment the ports block — but you'll need to ensure WoL broadcast
+    # reaches the LAN (e.g. via a macvlan network or a WoL relay).
+    # ports:
+    #   - "${LAZUROS_LISTEN_PORT:-8080}:8080"
